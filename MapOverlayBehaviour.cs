@@ -33,6 +33,7 @@ namespace BetterKingdom
         private const float OilSourceScanInterval = 5f;   // 火油桶：运送中桶的来源（工坊）重扫间隔，计数本身跟随中频刷新
         private const float CaveScanRetryInterval = 2.5f;  // 洞窟坐标未采到前的快速重扫间隔（洞窟对象可能晚于边界创建）
         private const int CaveScanMaxRetries = 8;    // 快速重扫次数上限（用尽后本岛不再扫描）
+        private const int PortScanMaxRetries = 8;    // 港口对象未采到时的重试次数上限（对象通常随关卡加载即存在）
         private const float FarmScanInterval = 20f;  // 农田引用重建间隔（静态关卡对象，全场景扫描不宜过密）
         private const float HouseScanInterval = 20f; // 民房（重建难民营）全场景扫描间隔
         private const float WallSiteRescanInterval = 30f;  // 城墙建造位候选列表重建间隔
@@ -63,12 +64,15 @@ namespace BetterKingdom
         private readonly List<MapMarker> _mountMarkers = new();
         private readonly List<MapMarker> _chestMarkers = new();
         private readonly List<MapMarker> _techMarkers = new();
+        private readonly List<MapMarker> _portMarkers = new();   // 港口（破损船/摇铃/离岛出发处）
+        private bool _portsScanned;                              // 港口在本岛是否已采集到
+        private int _portRetryScans;                             // 港口未找到时的重试计数
         // 双向传送门成对连线（A/B 为两端世界X；Level 为引导线分层，避免多组连线在同一高度重合）
         private struct TeleLink { public float A; public float B; public int Level; }
         private readonly List<float> _teleporterX = new();
         private readonly List<TeleLink> _teleLinks = new();
-        private Texture2D _texCamp, _texStatue, _texMount, _texChest, _texTech, _texTeleporter, _texTeleLink;
-        private GUIStyle _styleCamp, _styleStatue, _styleMount, _styleChest, _styleTech, _styleTeleporter, _styleTeleLink;
+        private Texture2D _texCamp, _texStatue, _texMount, _texChest, _texTech, _texTeleporter, _texTeleLink, _texPort;
+        private GUIStyle _styleCamp, _styleStatue, _styleMount, _styleChest, _styleTech, _styleTeleporter, _styleTeleLink, _stylePort;
 
         // 世界空间悬浮条（怪物血条/作物生长进度）
         private Texture2D _texBarBg, _texHpFill, _texCropFill;
@@ -217,6 +221,7 @@ namespace BetterKingdom
             _texTech = MakeSolidTexture(new Color(0.3f, 0.55f, 1f, 1f));      // 科技解锁点：蓝
             _texTeleporter = MakeSolidTexture(new Color(0.42f, 0.6f, 0.95f, 1f));   // 自建传送门：偏蓝的灰蓝
             _texTeleLink = MakeSolidTexture(new Color(0.5f, 0.68f, 1f, 1f));       // 双向传送门连线：与传送门相近、略亮
+            _texPort = MakeSolidTexture(new Color(0.2f, 0.85f, 0.9f, 1f));         // 港口：青色（区别于传送门的蓝）
             _texBarBg = MakeSolidTexture(new Color(0f, 0f, 0f, 0.65f));       // 悬浮条底：半透明黑
             _texHpFill = MakeSolidTexture(new Color(0.85f, 0.15f, 0.2f, 1f)); // 怪物血条：红
             _texCropFill = MakeSolidTexture(new Color(0.35f, 0.85f, 0.3f, 1f)); // 作物进度：绿
@@ -236,6 +241,7 @@ namespace BetterKingdom
             _styleTech = MakeSolidStyle(_texTech);
             _styleTeleporter = MakeSolidStyle(_texTeleporter);
             _styleTeleLink = MakeSolidStyle(_texTeleLink);
+            _stylePort = MakeSolidStyle(_texPort);
             _styleBarBg = MakeSolidStyle(_texBarBg);
             _styleHpFill = MakeSolidStyle(_texHpFill);
             _styleCropFill = MakeSolidStyle(_texCropFill);
@@ -334,6 +340,7 @@ namespace BetterKingdom
             DestroyImmediate(_texTech);
             DestroyImmediate(_texTeleporter);
             DestroyImmediate(_texTeleLink);
+            DestroyImmediate(_texPort);
             DestroyImmediate(_texBarBg);
             DestroyImmediate(_texHpFill);
             DestroyImmediate(_texCropFill);
@@ -899,6 +906,10 @@ namespace BetterKingdom
             _houseMarkers.Clear();
             _statueMarkers.Clear();
             _chestMarkers.Clear();
+            // 港口：新岛位置不同，重新采集
+            _portMarkers.Clear();
+            _portsScanned = false;
+            _portRetryScans = 0;
         }
 
         /// <summary>
@@ -1047,6 +1058,12 @@ namespace BetterKingdom
                 _techSources.Clear();
                 _techScanned = false;     // 同上：再次打开时重新采集一次
             }
+            if (!ModWindowBehaviour.ShowPorts)
+            {
+                _portMarkers.Clear();
+                _portsScanned = false;    // 再次打开时重新采集一次
+                _portRetryScans = 0;
+            }
 
             try
             {
@@ -1087,6 +1104,15 @@ namespace BetterKingdom
                     _techSources.Clear();
                     CollectTechMarkers();
                     _techScanned = true;
+                }
+
+                // 港口（码头/摇铃/出航点）：静态关卡对象，本岛采集到一次后不再扫描；
+                // 对象可能晚于本岛加载出现，未找到时按重刷新节奏有限次重试
+                if (ModWindowBehaviour.ShowPorts && !_portsScanned && _portRetryScans < PortScanMaxRetries)
+                {
+                    CollectPortMarkers();
+                    if (_portMarkers.Count > 0) _portsScanned = true;
+                    else _portRetryScans++;
                 }
             }
             catch { }
@@ -1689,6 +1715,27 @@ namespace BetterKingdom
         }
 
         /// <summary>
+        /// 收集港口标记：只取离岛出航位置（BoatSailPosition，付钱上船/起航的触发点），
+        /// 即玩家真正离岛出发的地方；不再取摇铃或码头的坐标。
+        /// 用 Include 连同未激活对象一起查找，避免港口尚未解锁时拿不到坐标。
+        /// </summary>
+        private void CollectPortMarkers()
+        {
+            _portMarkers.Clear();
+            try
+            {
+                var objs = UnityEngine.Object.FindObjectsByType<BoatSailPosition>(FindObjectsInactive.Include, FindObjectsSortMode.None);
+                if (objs == null) return;
+                for (int i = 0; i < objs.Length; i++)
+                {
+                    if (TryGetX(objs[i], out float x))
+                        _portMarkers.Add(new MapMarker { X = x, Label = "港口" });
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
         /// 收集自建传送门：World.teleporters 中的 PayableTeleporter。
         /// linkedTo 为空 = 普通传送门（可在地图任意位置往返穿梭）；
         /// linkedTo 非空 = 双向传送门（由传送裂缝建成，只能在两端之间定点穿梭），成对记录连线。
@@ -1930,6 +1977,8 @@ namespace BetterKingdom
                     DrawTeleLink(link, centerY, maxLinkLevel);
                 foreach (float x in _teleporterX)
                     DrawDotWithLabel(x, centerY, DotRadius - 1f, _styleTeleporter, "传送门");
+                foreach (MapMarker m in _portMarkers)
+                    DrawDotWithLabel(m.X, centerY, DotRadius - 1f, _stylePort, m.Label);
                 // 箭塔与城墙："只显示已建造"开启时过滤掉建造位与建造中（标签含"建造"）的标记
                 if (ModWindowBehaviour.ShowAllDefenses)
                 {

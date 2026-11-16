@@ -139,11 +139,12 @@
     **总体节奏（2026-11 调优后）**：进攻检测 0.3s（两侧都有进攻时 1s）、缓存 0.5s、禁用排队复钳 1s（分配补丁已即时复钳，这里只兜底）、就近改派 1s、墙体纠错 3s（墙体边界 5s 重建）。地图覆盖层：轻刷新 10Hz（玩家位置改成每帧单独读）、中频 0.15s（时间/季节/职业/金币/火油桶）、重刷新 3s、火油桶来源扫描 5s、农田 20s、民房 20s、城墙建造位 30s；驻守侧改派已改为事件驱动（传送门摧毁/工人启用/SetWorkerSide/换岛），无周期扫描；洞窟、城堡、坐骑、科技点、雕像、宝箱均按“本岛只采集一次”缓存（换岛由 `ResetIslandCaches` 清空）。
     `RebalanceQueuedWork` 先筛一次空闲候选池（`_balanceIdleBuffer`/`_balanceIdleX`），内层只做浮点距离比较；原实现逐工作重复查询全部工人状态是 O(n²) 互操作，是卡顿来源之一。
     `FixWallDefensePositions` 不再重复调用 `DisableWallQueueing`（避免与 1s 复钳重复劳动），墙体碰撞体只在 `WallBoundsScanInterval`(5s) 或换岛时重建。
-10. **玩家最高移速 6.3（功能设置页开关「玩家移动速度提升」）**：原版奔跑约 4.29（实测 4.28~4.30 浮动）。开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（2Hz）里执行：
-    ①`player.steed.runSpeed` 不足 `PlayerRunSpeedCap`(6.3) 时写 6.3，并用 `_boostedSteeds` 记录每个坐骑改动前的原值（同一坐骑只记一次）；
-    ②`player.mover._moveSpeed` 落在 [4,6.3) 时抬到 6.3（让当前正在跑的这一段立刻生效）。
-    关闭开关时按记录把 `runSpeed` 还原、并把精确等于 6.3 的 `_moveSpeed` 退回原值，无需重启游戏。
-    只用 [4,6.3) 区间，行走速度（远低于 4）与冲刺/特殊加速（高于 6.3）都不动。`PlayerRunSpeedGuard`(4) 与上限同用一处常量，改速度只需动 `PlayerRunSpeedCap`。如需核对实际速度，临时用 `Player.currentSpeed` 观察，用完删除。
+10. **玩家奔跑速度 +50%（功能设置页开关「玩家移动速度提升」）**：不再写死数值，按当前坐骑自身的奔跑速度动态提升到 150%。
+    开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（2Hz）里执行：
+    ①取 `player.steed.runSpeed` 作为基础值（已记录过则用 `_boostedSteeds` 里的原值，避免反复乘 1.5），目标值 = 基础值 × `PlayerRunSpeedBoostRatio`(1.5)；
+    ②当前 `runSpeed` 不高于目标值时才写入目标值；已高于目标的特殊加速（冲刺等）保持不动；
+    ③`player.mover._moveSpeed` 落在 [基础值, 目标值] 时抬到目标值（让当前正在跑的这一段立刻生效），行走速度远低于基础值不受影响。
+    关闭开关时按记录把 `runSpeed` 还原、并把等于目标值的 `_moveSpeed` 退回原值，无需重启游戏。
 11. **摇铃立即上船必须延后一帧**（`EmbarkeeInstantBoardPatch`）：不能在 `Embarkee.SetEmbarkableTarget` 的 Postfix 里直接 `Embark()`。
     读档/回岛时 `Boat.ApplyData` / `LoadLegacyEmbarkees` 的恢复顺序是 `StopInert → SetEmbarkableTarget → 游戏自己 Embark()`，Postfix 抢先调用会让同一单位 `Embark` 两次；`Embark()` 先置 `IsEmbarked=true` 再申请座位，重复调用会重复占座，下船时同一单位被处理两次，导致整船 4 弓箭手 + 3 工人卡在码头原地动画，只有重开游戏才恢复。
     正确做法：Postfix 只把单位加入 `FeatureBehaviour._pendingInstantBoards`，Update 下一帧检查 `!IsEmbarked` 且目标仍是船后才 `Embark()`；加载期间（`IsOverlayVisible()==false`）直接清空队列。
@@ -260,6 +261,11 @@ csproj 需引用：`Cpp2IL.Core`、`LibCpp2IL`、`AssetRipper.Primitives`、`Ass
 | 怪物竖线        | 深紫 `(0.55,0.15,0.75)`  |
 | **自建传送门**   | 偏蓝灰蓝 `(0.42,0.6,0.95)` |
 | **双向传送门连线** | 偏蓝偏亮 `(0.5,0.68,1)`   |
+| **港口**        | 青 `(0.2,0.85,0.9)`      |
+
+港口标记（显示设置「显示港口」）：位置只取出航点 `BoatSailPosition`（付钱上船/起航的触发点，即真正离岛出发的地方），
+不再取摇铃 `BoatSummoningBell` 或码头 `Wharf` 的坐标；用 `FindObjectsByType<BoatSailPosition>(FindObjectsInactive.Include, …)` 查找，
+本岛采集到一次后不再扫描（未找到时最多重试 8 次，换岛重置）。
 
 双向传送门样式：在端点标记上方 8px 处画两端竖线段 + 顶部横线（2px 粗），先画线再画点。
 

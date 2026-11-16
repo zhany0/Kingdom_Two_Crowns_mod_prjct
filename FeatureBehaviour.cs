@@ -27,13 +27,12 @@ namespace BetterKingdom
         private const float WorkBalanceInterval = 1f;        // 排队工作就近改派检测间隔（改派晚 1 秒无感知）
         private const float WorkBalanceMargin = 0.5f;       // 就近改派的最小距离优势，避免频繁来回改派
         private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 38 - 3×钻石数）
-        private const float PayHoldThreshold = 0.25f; // 长按判定阈值（秒），短点击不触发取款
+        private const float PayHoldThreshold = 0.35f; // 长按判定阈值（秒），短点击不触发取款
         private const float BankerScanInterval = 3f;    // 银行家（税官）场景查找最小间隔（全场景遍历，两个组件共用一份缓存）
         private const float StationSideCheckInterval = 2f;  // 传送门被毁后的驻守侧改派检测间隔（只在单侧无门时才有写操作）
         private const int HeavySlotGapFrames = 1;           // 两个重型任务之间至少空出的帧数
         private const float SafeDistance = 15f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
-        private const float PlayerRunSpeedCap = 6.3f;   // 玩家奔跑最高速度：原版约 4.29，这里提升到 6.3
-        private const float PlayerRunSpeedGuard = 4f;   // 判定“正在奔跑”的下限
+        private const float PlayerRunSpeedBoostRatio = 1.5f; // 玩家奔跑速度提升比例：按当前坐骑基础奔跑速度 ×1.5（+50%）
 
         private Player _cachedPlayer;
         private Player _cachedPlayer2;
@@ -608,11 +607,11 @@ namespace BetterKingdom
         }
 
         // 开启移速提升前各坐骑的原始奔跑速度（关闭开关时按原值还原）
-        private struct BoostedSteed { public int Id; public Steed Steed; public float BaseRunSpeed; }
+        private struct BoostedSteed { public int Id; public Steed Steed; public float BaseRunSpeed; public float BoostedRunSpeed; }
         private static readonly List<BoostedSteed> _boostedSteeds = new List<BoostedSteed>();
 
         /// <summary>
-        /// 按“玩家移动速度提升”开关同步移速：开启时把奔跑最高速度抬到 5.8（原版约 4.29），
+        /// 按“玩家移动速度提升”开关同步移速：开启时把当前坐骑的奔跑速度提升到原值的 150%（+50%），
         /// 关闭时把之前改过的坐骑全部还原，保证开关即时生效。
         /// </summary>
         private static void SyncPlayerSpeedBoost(Player p1, Player p2)
@@ -630,57 +629,92 @@ namespace BetterKingdom
             RestorePlayerMoverSpeed(p2);
             for (int i = 0; i < _boostedSteeds.Count; i++)
             {
-                try { if (_boostedSteeds[i].Steed != null) _boostedSteeds[i].Steed.runSpeed = _boostedSteeds[i].BaseRunSpeed; } catch { }
+                try
+                {
+                    Steed s = _boostedSteeds[i].Steed;
+                    if (s == null) continue;
+                    float cur = s.runSpeed;
+                    // 只还原落在 [原值, 提升值] 之间的数值，避免覆盖其他来源的更高特殊速度
+                    if (cur >= _boostedSteeds[i].BaseRunSpeed - 0.05f && cur <= _boostedSteeds[i].BoostedRunSpeed + 0.05f)
+                        s.runSpeed = _boostedSteeds[i].BaseRunSpeed;
+                }
+                catch { }
             }
             _boostedSteeds.Clear();
         }
 
         /// <summary>
-        /// 把玩家的奔跑最高速度提升到 PlayerRunSpeedCap：
+        /// 把玩家的奔跑速度提升到当前坐骑基础值的 150%：
         /// 直接改坐骑的 runSpeed，让游戏下一次进入奔跑时按新速度走；
-        /// 同时把当前已生效的移动目标速度抬到目标值，避免正在奔跑的这一段仍停留在旧速度。
-        /// 只处理 [Guard, Cap) 区间——行走速度远低于 4，冲刺/特殊加速高于 Cap 的一律不动。
+        /// 同时把当前已生效的移动目标速度抬到提升值，避免正在奔跑的这一段仍停留在旧速度。
+        /// 只处理“不低于该坐骑原奔跑速度”的移动——行走速度远低于原值，冲刺等更高特殊速度也一律不动。
         /// </summary>
         private static void BoostPlayerRunSpeed(Player player)
         {
             if (player == null) return;
+            float baseSpeed = 0f, target = 0f;
+            bool boosted = false;
             try
             {
                 Steed steed = player.steed;
                 if (steed != null)
                 {
-                    float speed = steed.runSpeed;
-                    if (speed < PlayerRunSpeedCap)
+                    baseSpeed = GetSteedBaseRunSpeed(steed, steed.runSpeed);
+                    target = baseSpeed * PlayerRunSpeedBoostRatio;
+                    // 已是更高特殊速度时不改写，避免覆盖游戏自身的加速效果
+                    if (target > baseSpeed + 0.01f && steed.runSpeed <= target + 0.05f)
                     {
-                        RememberSteedBaseSpeed(steed, speed);   // 只记录第一次的原值
-                        steed.runSpeed = PlayerRunSpeedCap;
+                        RememberSteedBaseSpeed(steed, baseSpeed, target);
+                        if (Math.Abs(steed.runSpeed - target) > 0.01f) steed.runSpeed = target;
+                        boosted = true;
                     }
                 }
             }
             catch { }
+            if (!boosted) return;
             try
             {
                 Mover mover = player.mover;
                 if (mover != null)
                 {
                     float speed = mover._moveSpeed;
-                    if (speed >= PlayerRunSpeedGuard && speed < PlayerRunSpeedCap)
-                        mover._moveSpeed = PlayerRunSpeedCap;
+                    // 正以原奔跑速度或当前提升值移动时才改写；行走（远低于原值）与更高速度不动
+                    if (speed >= baseSpeed - 0.05f && speed <= target + 0.05f)
+                        mover._moveSpeed = target;
                 }
             }
             catch { }
         }
 
-        /// <summary>记录坐骑被改动前的原始奔跑速度（同一坐骑只记一次）。</summary>
-        private static void RememberSteedBaseSpeed(Steed steed, float baseSpeed)
+        /// <summary>取坐骑被提升前的原始奔跑速度（未记录过则视为当前值）。</summary>
+        private static float GetSteedBaseRunSpeed(Steed steed, float current)
         {
             try
             {
                 int id = steed.GetInstanceID();
                 for (int i = 0; i < _boostedSteeds.Count; i++)
-                    if (_boostedSteeds[i].Id == id) return;
+                    if (_boostedSteeds[i].Id == id) return _boostedSteeds[i].BaseRunSpeed;
+            }
+            catch { }
+            return current;
+        }
+
+        /// <summary>记录坐骑被改动前的原始奔跑速度与提升后的目标值（同一坐骑只记录一次）。</summary>
+        private static void RememberSteedBaseSpeed(Steed steed, float baseSpeed, float boostedSpeed)
+        {
+            try
+            {
+                int id = steed.GetInstanceID();
+                for (int i = 0; i < _boostedSteeds.Count; i++)
+                {
+                    if (_boostedSteeds[i].Id != id) continue;
+                    BoostedSteed rec = _boostedSteeds[i];
+                    rec.BoostedRunSpeed = boostedSpeed;
+                    _boostedSteeds[i] = rec;
+                    return;
+                }
                 if (_boostedSteeds.Count >= 8) return;   // 正常只会接触几匹马，上限防止列表无限增长
-                _boostedSteeds.Add(new BoostedSteed { Id = id, Steed = steed, BaseRunSpeed = baseSpeed });
+                _boostedSteeds.Add(new BoostedSteed { Id = id, Steed = steed, BaseRunSpeed = baseSpeed, BoostedRunSpeed = boostedSpeed });
             }
             catch { }
         }
@@ -694,13 +728,13 @@ namespace BetterKingdom
                 Steed steed = player.steed;
                 Mover mover = player.mover;
                 if (steed == null || mover == null) return;
-                if (mover._moveSpeed < PlayerRunSpeedCap - 0.05f) return;   // 不是我们写入的高值
                 int id = steed.GetInstanceID();
                 for (int i = 0; i < _boostedSteeds.Count; i++)
                 {
                     if (_boostedSteeds[i].Id != id) continue;
-                    if (mover._moveSpeed <= PlayerRunSpeedCap + 0.05f)
-                        mover._moveSpeed = _boostedSteeds[i].BaseRunSpeed;
+                    BoostedSteed rec = _boostedSteeds[i];
+                    if (Math.Abs(mover._moveSpeed - rec.BoostedRunSpeed) <= 0.05f)
+                        mover._moveSpeed = rec.BaseRunSpeed;
                     return;
                 }
             }
