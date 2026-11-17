@@ -105,18 +105,17 @@
    骑士是另一套机制：`Kingdom.RankKnights` 给同侧骑士依次写 `Knight.rank = 1..N`，`Knight.GetTargetPos` 站位 = 墙位 ∓ `rank`×`_distanceFromWall`（rank 从 1 起算，无单独最小间距），同一开关下把 `rank > 1` 的骑士归 1；骑士跟随士兵随骑士整体前移，无需单独处理。
    `Knight.ShouldGoToWall` 会比较当前位置与 `GetTargetPos()`，因此写回 `rank` 后骑士会自行重新走位，无需调用 `RankKnights()`。
    `Pikeman` 有独立的三格墙位（`Pikeman.Assign(Wall, readiness)`，站位含 `3-readiness`），不是长队；`Berserker` 只有固定 `distanceFromWall`，无排队序号。
-6. **工人墙外避险**：不区分昼夜，某侧存在"进攻状态"怪物且工人自身位置在该侧安全距离之外时，工人跑回城墙驻守，直到该侧进攻怪物数量为 0。
-   进攻判据：`!Enemy.IsDespawning && !Enemy.shouldRetreat && !damageable.isDead && gameObject.activeSelf && Enemy.loot == null`（`loot` 非空＝已拖着金币/战利品撤回传送门）；**死亡还必须覆盖“血量已空但 isDead 尚未置位”的死亡动画期**（`hitPoints <= 0 && initialHitPoints > 0` 视为已死），否则怪物死光后该侧威胁会多挂一段时间、工人白跑一趟；`Enemy` 无侧别字段，用 x 与 `kingdom.castle` 的 x 比较分侧，检测周期 `AssaultCheckInterval`(0.3s，两侧都已确认有进攻时放宽到 0.5s)（`RefreshSideAssault`）。
-   安全距离：墙内始终安全；墙外要求距该侧城墙外沿 ≤ `SafeDistance`（15，2026-11 由 20 下调）；该侧还没有城墙时从主城（`kingdom.castle`）位置起算（`TryGetOuterWallX` 里已处理）。
-   实现只用 `Worker.ShouldShelter` 的 Postfix 强制返回真：原生实现首行是 `if (kingdom.isSafe) return false`，白天会被游戏的安全态按掉，所以才需要补丁。判据 `ShouldFleeToWall` 只看工人自身位置。
-   **统一判据（按工作点，不按工人所在侧）**：`IsWorkSpotSafe(kingdom, x)` 先用 x 与 `kingdom.castle` 的 x 分侧（与怪物分侧口径一致，取不到城堡时退回露营火堆位置），再走 `IsPositionSafe`。该侧有怪且工作点在安全距离外即为不安全，**任何人都不许接**。
-   ①`Worker.AssignJob(Workable)` Prefix 一律拒绝不安全工作点（`WorkerAssignSafeJobPatch`）——左侧出怪时，右侧工人也接不到左侧的危险活；②`SuspendUnsafeQueuedWork` 遍历 `kingdom.Workers` 撤下所有**已分配但还没开始**的不安全 `_queuedWork`（不再按侧分流，与 Prefix 同一判据，工作往往在怪物出现前就已分配好，Prefix 管不到）；③**不撤 `_currentWork`**：正在干的活按原生优先级（Work > Shelter）干完再回城（`CancelWork`/`ResetWorkState` 打断工作会引发恢复难题）。
-   **绕过 AssignJob 的付费接活路径（补丁 ④⑤，2026-11-02 补）**：`Worker` 实现 `IUnitControllable.UpdatePayState`（interop 名 `IUnitControllable_UpdatePayState`，IL 中 `[this+200]=workable; [this+386]=1`）——玩家长按支付时把 `_maxWorkDistance` 内**任意** `Kingdom.GetTotalWork()` 工作直接写进 `_queuedWork` 并置 `__forceWork`（属性名 `_forceWork`），完全跳过 `AssignJob`；`Worker.Behaviour` 协程随后按 `_queuedWork` 的坐标 `Mover.SetGoal` 走过去，再在 IL 745 调 `SetCurrentWork(_queuedWork)` 转成当前工作（这是所有排队工作转当前工作的唯一漏斗）。
-   ④`WorkerPayWorkSafePatch`：`IUnitControllable_UpdatePayState` Postfix 调 `FeatureBehaviour.CancelUnsafeQueuedWork`（撤销不安全 `_queuedWork`、`CancelWork` 释放工作位、清 `_forceWork`），分配动作结束的同一帧就撤掉；⑤`WorkerSetCurrentWorkSafePatch`：`Worker.SetCurrentWork` Prefix 用 `CanStartWork` 拒绝在危险工作点启动（null 放行），是覆盖所有路径的最后防线。`CanStartWork` / `CancelUnsafeQueuedWork` 与 `AssignJob` 拦截共用 `IsWorkSpotSafe` 判据。
-   **让工人回来干活**：`ResumeSuspendedWork` 在工作点重新变安全（该侧进攻怪归零）后立刻 `AssignJob` 还回被撤下的工作；`JobAvailable()` 为假时保留记录下次重试，工人已有活则丢弃记录；`SuspendedJob` 不记录侧别，恢复时全部按工作点重算。
-   光还回记录还不够：游戏原生只在 `Director.IsDaytime` 时由 `Worker+<Behaviour>d__111::MoveNext` 调 `Kingdom.ReassignWork`（IL 356-371：`Kingdom.WorkAvailable() && Director.get_IsDaytime()`），**夜间根本不分配新工作**。所以在 `RefreshSideAssault` 里检测 `_attackOnLeft/_attackOnRight` 由真变假的那一帧，主动调用一次 `kingdom.ReassignWork()`，让夜间怪物被清掉后工人立即出门；`Kingdom.ReassignWork` 本身不检查昼夜，`Worker.ResetWorkState` 夜间也会调用。
-   判据：`IsAssaultingEnemy` = `!IsDespawning && !shouldRetreat && !damageable.isDead && gameObject.activeSelf && loot == null`；`loot` 非空＝已拖着金币/战利品回传送门，不算进攻怪物（否则逃跑的怪会让工人一直不敢出门）。
-   该补丁不碰 `isSafe` 与 `Director` 时钟，避免复发“复仇血月结束后时间卡死”的问题（该问题根因是白天提前 `BecomeSafe` 跳过了原生收尾分支）。
+6. **避怪距离（工人/弓箭手）**：**不再写 `Worker.fleeRange`/`fleeRangeOutsideKingdom`/`Archer.fleeRange` 字段**（保持预制体原值 6）——游戏还用 fleeRange 计算驻守/避怪落点：`Worker.Behaviour` 里 `落点X = Kingdom.GetBorderSideIntact(侧) - Random.Range(fleeRange, fleeRange+3) × 侧向`（+3 是常量 [0x1830B0BC4]=3.0），原值 6 即站在城墙内侧 6~9 格；把动态值（墙内=0、贴墙=很小）写进去会让工人驻守位置贴到城墙上（“驻守位置距离城墙太近”的根因）。
+   动态避怪阈值改由 `ComputeFleeRange`（`FleeRangeWallFactor`=1.2）**只在补丁内计算**：墙外 = 自身到该侧已完成城墙外沿的距离 ×1.2；墙内 = 0（有墙保护，不需要后撤）；该侧没有已完成城墙（还没建墙或全被摧毁）= 改按自身到主城（`kingdom.castle`）的距离 ×1.2，连主城都取不到才**兜底回退游戏原生距离 `InitialFleeRange`(6)**（与预制体 fleeRange 原值一致）。
+   分侧以 `kingdom.castle` 的 x 为界（`AttackSideFromX`）；墙沿用 `_wallBounds`（`CollectWallBounds` 每 `SafetyBoundsScanInterval`(0.5s) 由 `RefreshWallBounds` 重建，`UnderConstruction` 的施工中城墙不参与，`TryGetOuterWallX` 取该侧最外墙沿），换岛时清空并立即重建。
+   **MOD 已不再有“安全距离”（`SafeDistance`）那套派活/回城判据**（AssignJob / SetCurrentWork / 付费接活撤销 / ShouldShelter / 撤销排队工作 / 夜间重新分配等补丁与逻辑均已删除），工人避险完全交给游戏原生的 fleeRange 机制。
+   **原生避怪机制（2026-11-17 逆向结论，Cpp2IL dump 在 %TEMP%\flee_il_*.txt）**：判定入口 `Worker.ShouldFlee()`（状态机每 tick 调用）**实时读** `fleeRange`(+60)/`fleeRangeOutsideKingdom`(+64)，阈值按 `Kingdom.IsWithinWalls` 二选一，比较的是 **|this.x - enemy.x|（仅 X 轴）< 阈值** 即避怪；`Archer.ShouldFlee()` 实时读 `fleeRange`(+96)，已在 Flee 态时 sticky 返回真。
+   状态机 `Worker+<>c__DisplayClass111_0::<Behaviour>b__0` 优先级：Inert64>Grabbed32>Stationary2048>PlayerControl512>GoToEmbarkable1024>InFormation256>**Flee8**>GrabTool128>**Work2**>Shelter1>CheckForWork4——**Flee 优先于 Work**；离开 Work 的转移回调 `::<Behaviour>b__2` 会先 `ResetWorkState(true)`（`_currentWork` 搬回 `_queuedWork` 并 `Kingdom.ReassignWork`）再 `SetCurrentWork(null)`，所以让 ShouldFlee 返回真即可干净卸活，无需手动处理工作状态。
+   **两个原生坑（本次修复的原因）**：①`ShouldFlee` 开头有“**手上有活（`_currentWork`/`_queuedWork` 非空未完成）就返回 false**”的闸门——开工的工人敌人逼近也不避怪、继续朝工作点走（“避怪时先向工作地点跑”）；②敌人探测靠单位自带 `Scanner`（`Worker._enemyScanner`+176、`Archer._enemyScanner`+392），`Awake` 时用 `LayerMask("Enemies")` 构造，**前向探测半径是硬编码常量 6.0**、后向 `rangeBehind` 生成时读一次（Worker 读 fleeRangeOutsideKingdom、Archer 读 shootRange）——fleeRange 写得再大，超出 ~6 的敌人也探测不到（“避怪距离不对”）。
+   **MOD 修法**：`RefreshFleeEnemies`（`FleeEnemyScanInterval` 0.3s，走重型槽位）用 `EnemyManager.AllEnemies` 自行扫描并缓存危险敌人 X（过滤 `IsDespawning`/`shouldRetreat`/`loot!=null`/已死/`QuestStructure`/`SerpentWeakPoint`；GreedGolem 继承 Workable 不是 Enemy，天然不在列表）；`WorkerForceFleePatch`/`ArcherForceFleePatch` 是 `ShouldFlee` 的 Postfix，用 `ForceFleeIfThreatened`（`ComputeFleeRange` 现算阈值 + 缓存表最近敌人 X 轴距离）强制返回真。热路径只做浮点比较，不遍历敌人。
+   **避怪粘滞（防“避怪过程中间断性外出工作”）**：`WorkerForceFleePatch` 里若该单位所在侧仍有进攻怪物（`HasEnemyOnSide`：缓存敌人与单位同侧，分界=主城 x），一旦本帧触发避怪（原生或强制）就把 `GetInstanceID()` 记入 `_stickyFleeWorkers`，此后该侧怪物清零前 ShouldFlee 恒真——状态机 Flee(8) 优先于 Work(2)，工人一直保持 Flee 态不再外出；**粘滞只对城墙外单位生效**（`fleeRange > 0`）：回到城墙内后解除粘滞，退化为游戏原生驻守行为（原生墙内按 fleeRange=6 近距离避险），避免墙内持续 Flee 跑向另一侧（Flee 落点由 `_targetSide` 决定，与当前所在侧不一致时会在墙内穿城跑）；该侧敌人清零（危险缓存 0.3s 内更新）后懒移除标记恢复工作；换岛时整集合清空。**弓箭手（`ArcherForceFleePatch` + `_stickyFleeArchers`）采用完全相同的粘滞逻辑**。
+   调试竖线已按用户要求**整体删除**（调试内容，代码不含调试线）。
+
 7. **钱袋与国库共通**：真实国库账本是 `Banker._stashedCoins`（存档走 `BankerData.stashedCoins`）；
    `Castle._currentCoinCount` 只是城堡金币堆的显示镜像（`SendStashCount`/`RecvStashCount` RPC 同步，`Castle.stash` + `stashHeight` 按数量画高度），**不参与存档**。
    因此国库未解锁（场景里没有 `Banker`）时整个联动必须关闭，否则溢出金币写进显示字段会丢失、取款还会凭空造币。判定入口：`_cachedBanker == null` 直接 return。
@@ -136,14 +135,15 @@
     槽位还要求相邻两个重型任务之间至少空出 `HeavySlotGapFrames`(1) 帧，把重活摊平到多帧，避免连续帧都压着重任务形成卡顿。
     各任务周期都远大于一帧，因此不会饿死；安全检测放在 Update 最前，优先拿槽位。
     `Awake` 里按不同相位初始化计时器（0/0.1/0.5/0.6/0.7s），避免首帧全部到期后连续多帧排队。每帧仍照常执行的任务只有 `UpdatePurseTreasuryLink`、`SyncWallQueueSwitch`、`EnsureTimeNotStuck`（都很轻且需要帧级/秒级精度）。
-    **总体节奏（2026-11 调优后）**：进攻检测 0.3s（两侧都有进攻时 1s）、缓存 0.5s、禁用排队复钳 1s（分配补丁已即时复钳，这里只兜底）、就近改派 1s、墙体纠错 3s（墙体边界 5s 重建）。地图覆盖层：轻刷新 10Hz（玩家位置改成每帧单独读）、中频 0.15s（时间/季节/职业/金币/火油桶）、重刷新 3s、火油桶来源扫描 5s、农田 20s、民房 20s、城墙建造位 30s；驻守侧改派已改为事件驱动（传送门摧毁/工人启用/SetWorkerSide/换岛），无周期扫描；洞窟、城堡、坐骑、科技点、雕像、宝箱均按“本岛只采集一次”缓存（换岛由 `ResetIslandCaches` 清空）。
+    **总体节奏（2026-11 调优后）**：危险敌人扫描 0.3s（供 ShouldFlee 强制补丁查表）、城墙边界/避怪距离 0.5s、缓存 0.5s、禁用排队复钳 1s（分配补丁已即时复钳，这里只兜底）、就近改派 1s、墙体纠错 3s（墙体边界 5s 重建）。地图覆盖层：轻刷新 10Hz（玩家位置改成每帧单独读）、中频 0.15s（时间/季节/职业/金币/火油桶）、重刷新 3s、火油桶来源扫描 5s、农田 20s、民房 20s、城墙建造位 30s；驻守侧改派已改为事件驱动（传送门摧毁/工人启用/SetWorkerSide/换岛），无周期扫描；洞窟、城堡、坐骑、科技点、雕像、宝箱均按“本岛只采集一次”缓存（换岛由 `ResetIslandCaches` 清空）。
     `RebalanceQueuedWork` 先筛一次空闲候选池（`_balanceIdleBuffer`/`_balanceIdleX`），内层只做浮点距离比较；原实现逐工作重复查询全部工人状态是 O(n²) 互操作，是卡顿来源之一。
     `FixWallDefensePositions` 不再重复调用 `DisableWallQueueing`（避免与 1s 复钳重复劳动），墙体碰撞体只在 `WallBoundsScanInterval`(5s) 或换岛时重建。
 10. **玩家奔跑速度 +50%（功能设置页开关「玩家移动速度提升」）**：不再写死数值，按当前坐骑自身的奔跑速度动态提升到 150%。
     开关 `ModWindowBehaviour.BoostPlayerSpeed`（ConfigEntry `_cfgPlayerSpeed`，默认关）由 `FeatureBehaviour.SyncPlayerSpeedBoost` 在 `RefreshCaches`（2Hz）里执行：
     ①取 `player.steed.runSpeed` 作为基础值（已记录过则用 `_boostedSteeds` 里的原值，避免反复乘 1.5），目标值 = 基础值 × `PlayerRunSpeedBoostRatio`(1.5)；
     ②当前 `runSpeed` 不高于目标值时才写入目标值；已高于目标的特殊加速（冲刺等）保持不动；
-    ③`player.mover._moveSpeed` 落在 [基础值, 目标值] 时抬到目标值（让当前正在跑的这一段立刻生效），行走速度远低于基础值不受影响。
+    ③`player.mover._moveSpeed` 只在 `player.actionState == Player.ActionState.Run`（真正按住奔跑键）且当前值仍等于该坐骑原奔跑速度（±0.05）时改成目标值——只抬“正在跑的这一段”，已到目标值不再重复写，松开冲刺键后游戏切回行走速度时绝不会被我们改回奔跑速度。
+    **「松开 Shift 仍奔跑」的根因**（二次修复）：原生 `Player.get_isRunning`（偏移 +372 actionState）逻辑为 `actionState==Run(1) → true`；`actionState==Glide(9) → |Rigidbody2D 速度| > steed.glidePayThreshold(+404) → true`。松开 Shift 后玩家进入 Glide 滑行态，isRunning 仍为 true，旧版代码继续每帧抬速 → 速度永远高于 glidePayThreshold → 卡死奔跑。改用 actionState==Run 判定后，Glide 期间不抬速，速度自然衰减到阈值以下恢复行走。
     关闭开关时按记录把 `runSpeed` 还原、并把等于目标值的 `_moveSpeed` 退回原值，无需重启游戏。
 11. **摇铃立即上船必须延后一帧**（`EmbarkeeInstantBoardPatch`）：不能在 `Embarkee.SetEmbarkableTarget` 的 Postfix 里直接 `Embark()`。
     读档/回岛时 `Boat.ApplyData` / `LoadLegacyEmbarkees` 的恢复顺序是 `StopInert → SetEmbarkableTarget → 游戏自己 Embark()`，Postfix 抢先调用会让同一单位 `Embark` 两次；`Embark()` 先置 `IsEmbarked=true` 再申请座位，重复调用会重复占座，下船时同一单位被处理两次，导致整船 4 弓箭手 + 3 工人卡在码头原地动画，只有重开游戏才恢复。

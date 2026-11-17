@@ -21,9 +21,10 @@ namespace BetterKingdom
         // 把全场景扫描/大集合遍历摊平到多帧，避免同一帧叠多个重活造成偶发卡顿。
         private const float CacheInterval = 0.5f;            // 玩家/城堡/税官缓存刷新间隔（数值变化慢，2Hz 足够）
         private const float HeavyInterval = 3f;              // 墙体/守卫槽修正间隔（纠错类，不需要 2 秒一次）
-        private const float WallBoundsScanInterval = 5f;     // 墙体边界重建间隔（墙只在建造/被毁时变化）
+        private const float WallBoundsScanInterval = 5f;     // 墙体边界重建间隔（仅供弓箭手守墙纠错使用）
+        private const float SafetyBoundsScanInterval = 0.5f; // 避怪距离参照的城墙边界刷新间隔（建墙后尽快生效）
+        private const float FleeEnemyScanInterval = 0.3f;    // 避怪强制判定的敌人扫描间隔（ShouldFlee 热路径只查这份缓存）
         private const float WallQueueClampInterval = 1f;     // 禁用排队时复钳间隔（分配补丁已即时复钳，这里只做兜底）
-        private const float AssaultCheckInterval = 0.3f;     // 墙外进攻怪物检测间隔（安全相关，保持 3Hz 以上）
         private const float WorkBalanceInterval = 1f;        // 排队工作就近改派检测间隔（改派晚 1 秒无感知）
         private const float WorkBalanceMargin = 0.5f;       // 就近改派的最小距离优势，避免频繁来回改派
         private const int PurseMaxCoins = 38;        // 钱袋容量上限（钻石占 3 金币位，有效金币上限 = 38 - 3×钻石数）
@@ -31,7 +32,8 @@ namespace BetterKingdom
         private const float BankerScanInterval = 3f;    // 银行家（税官）场景查找最小间隔（全场景遍历，两个组件共用一份缓存）
         private const float StationSideCheckInterval = 2f;  // 传送门被毁后的驻守侧改派检测间隔（只在单侧无门时才有写操作）
         private const int HeavySlotGapFrames = 1;           // 两个重型任务之间至少空出的帧数
-        private const float SafeDistance = 15f;         // 避险安全距离：工人位置距该侧城墙外沿（无墙时距主城）超过此值且该侧有怪物出击，就跑回城墙
+        private const float InitialFleeRange = 6f;      // 避怪距离兜底值：与游戏原生 Worker/Archer.fleeRange 一致（连主城都取不到时才用）
+        private const float FleeRangeWallFactor = 1.2f; // 避怪距离 = 自身距该侧城墙外沿的距离 × 此系数；已在墙内则置 0
         private const float PlayerRunSpeedBoostRatio = 1.5f; // 玩家奔跑速度提升比例：按当前坐骑基础奔跑速度 ×1.5（+50%）
 
         private Player _cachedPlayer;
@@ -45,7 +47,13 @@ namespace BetterKingdom
         private static bool _isMenuOpen;
         private float _payHoldStartP1 = -1f, _payHoldStartP2 = -1f;
         private float _nextCacheRefresh, _nextHeavyWork, _nextWallQueueClamp;
-        private static float _nextWallBoundsScan;              // 墙体边界下一次重建时刻
+        private static float _nextWallBoundsScan;              // 墙体边界下一次重建时刻（弓箭手纠错）
+        private static float _nextSafetyBoundsScan;            // 城墙边界/避怪距离的下一次刷新时刻
+        private static float _nextFleeEnemyScan;               // 下一次危险敌人扫描时刻（供 ShouldFlee 强制补丁使用）
+        private static readonly List<float> _fleeEnemyX = new(); // 危险敌人世界X缓存（仅X轴，与原生避怪比较口径一致）
+        internal static readonly HashSet<int> _stickyFleeWorkers = new(); // 已触发避怪的工人实例ID：该侧进攻怪物清零前持续避怪、不出外工作
+        internal static readonly HashSet<int> _stickyFleeArchers = new(); // 已触发避怪的弓箭手实例ID：逻辑与工人避怪粘滞相同
+        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _fleeEnemyBuffer;
         private static int _cachedKingdomId = -1;             // 用于检测换岛（Kingdom 实例变化）
         private static float _nextTimePauseCheck;             // 时间停滞检测节流时间
         private static float _lastDirectorTime = -1f;         // 上次采样到的游戏时刻（判断时钟是否真的不走）
@@ -53,29 +61,21 @@ namespace BetterKingdom
         private static int _timeStuckRepairs;                 // 停滞修补轮次：0=先恢复时钟与状态，1=仍不动则清理残留时间停止者
 
         // 城墙边界缓存（供弓箭手守墙bug修正使用）
-        private struct WallBound { public float X; public float HalfW; }
+        private struct WallBound { public float X; public float HalfW; public bool UnderConstruction; }
         private static readonly List<WallBound> _wallBounds = new();
 
         // 禁用排队机制：记录钳制前的原始排队值（键为对象实例ID），关闭开关时按原值立即还原
         private static readonly Dictionary<int, int> _savedGuardDepth = new();
         private static readonly Dictionary<int, int> _savedKnightRank = new();
         private bool _lastDisableWallQueue;
-        private static float _nextAssaultCheck;       // 下一次夜间进攻怪物检测时刻
         private static float _nextWorkBalance;        // 下一次排队工作就近改派时刻
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _balanceWorkerBuffer;
         // 就近改派复用的“空闲候选”池：每轮只筛一次，避免对每个排队工作重复做互操作状态查询（O(n²)）
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _balanceIdleBuffer;
         private static float[] _balanceIdleX;
-        private static bool _attackOnLeft, _attackOnRight;   // 夜晚该侧城墙外是否有进攻中的怪物
-        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy> _assaultEnemyBuffer;
-        private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _suspendWorkerBuffer;
-        // 传送门被毁后改派驻守侧时复用的工人缓冲（与避险缓冲分开，避免语义混淆）
+        // 传送门被毁后改派驻守侧时复用的工人缓冲
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker> _stationWorkerBuffer;
         private static float _nextStationSideCheck;   // 下一次传送门驻守侧检测时刻（周期检测）
-        // 该侧出现进攻怪物时被暂时撤下的“排队工作”（还没开始做）：怪物归零后立即还给原工人。
-        // 只撤排队工作、不撤 _currentWork——正在干的活按原生逻辑干完再避险。
-        private struct SuspendedJob { public Worker Worker; public Workable Job; }
-        private static readonly List<SuspendedJob> _suspendedJobs = new List<SuspendedJob>();
         // 周期性遍历复用缓冲：修正流程每 2 秒执行一次，反复分配 IL2CPP 数组会造成 GC 尖峰与掉帧
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Archer> _archerBuffer;
         private static Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Wall> _wallBuffer;
@@ -129,7 +129,7 @@ namespace BetterKingdom
             _lastDisableWallQueue = ModWindowBehaviour.DisableWallQueue;
             // 错峰初始化各周期任务：首帧若全部到期会连续多帧排队，这里按不同相位散开
             float now = Time.unscaledTime;
-            _nextAssaultCheck = now;
+            _nextSafetyBoundsScan = now;
             _nextCacheRefresh = now + 0.1f;
             _nextTimePauseCheck = now + 0.5f;
             _nextWallQueueClamp = now + 0.6f;
@@ -155,16 +155,19 @@ namespace BetterKingdom
 
             float now = Time.unscaledTime;
 
-            // 墙外有进攻怪物时，工人停止接活/撤销无法安全撤离的墙外工作（不区分昼夜：
-            // 传送门离城墙较远时游戏会在天黑前提前放怪）
-            // 安全判定优先占用重型槽位，其余周期任务都可以顺延一帧，威胁检测不能漏
-            if (now >= _nextAssaultCheck && TryReserveHeavySlot())
+            // 城墙边界刷新：建墙/破墙后 0.5 秒内反映到避怪阈值计算（ShouldFlee 强制补丁用）
+            if (now >= _nextSafetyBoundsScan && TryReserveHeavySlot())
             {
-                // 两侧都已确认有进攻时放宽到 0.5 秒复查（此时敌人数量多，扫描最贵），
-                // 只有一侧确认时保持 0.3 秒；超过这个间隔会让怪物死光后威胁标记多挂一会儿，
-                // 工人白跑一趟回城墙（回跑本身只是症状，真正的延迟在检测节奏上）
-                _nextAssaultCheck = now + ((_attackOnLeft && _attackOnRight) ? 0.5f : AssaultCheckInterval);
-                RefreshSideAssault();
+                _nextSafetyBoundsScan = now + SafetyBoundsScanInterval;
+                RefreshWallBounds();
+            }
+
+            // 危险敌人扫描：Worker/Archer 自带的 Scanner 探测半径固定约 6，fleeRange 写再大也看不见远处的敌人；
+            // 这里用 EnemyManager.AllEnemies 自行扫描缓存，ShouldFlee 补丁只查缓存做浮点比较（0.3 秒刷新一次）
+            if (now >= _nextFleeEnemyScan && TryReserveHeavySlot())
+            {
+                _nextFleeEnemyScan = now + FleeEnemyScanInterval;
+                RefreshFleeEnemies();
             }
 
             // 排队工作就近改派：原版把新工作交给先入队的空闲工人，这里改成离工作点最近的空闲工人
@@ -508,7 +511,11 @@ namespace BetterKingdom
                 _cachedKingdomId = kid;
                 _wallBounds.Clear();
                 _nextWallBoundsScan = 0f;        // 新岛必须立刻重建墙体边界
-                _suspendedJobs.Clear();
+                _nextSafetyBoundsScan = 0f;
+                _nextFleeEnemyScan = 0f;
+                _fleeEnemyX.Clear();
+                _stickyFleeWorkers.Clear();      // 旧岛工人的避怪粘滞标记作废（对象已销毁）
+                _stickyFleeArchers.Clear();      // 旧岛弓箭手的避怪粘滞标记作废（对象已销毁）
                 _pendingInstantBoards.Clear();
                 _bellQuotaActive = false;
                 _bellQuotaEmbarkable = null;
@@ -675,11 +682,15 @@ namespace BetterKingdom
             try
             {
                 Mover mover = player.mover;
-                if (mover != null)
+                // 只在真正按住奔跑键（Run 态）时改当前速度：松开 Shift 后玩家进入 Glide(9) 滑行态，
+                // 原生 isRunning 在该态仍为 true（速度 > glidePayThreshold 才算奔跑），若继续抬速会导致
+                // 速度永远高于阈值、卡死在奔跑。Glide 期间不抬速，让速度自然衰减恢复行走。
+                if (mover != null && player.actionState == Player.ActionState.Run)
                 {
                     float speed = mover._moveSpeed;
-                    // 正以原奔跑速度或当前提升值移动时才改写；行走（远低于原值）与更高速度不动
-                    if (speed >= baseSpeed - 0.05f && speed <= target + 0.05f)
+                    // 仅把“还停在原奔跑速度”的那一段抬到提升值；已经是提升值则不重复写，
+                    // 松开冲刺键后游戏把速度切回行走值时也绝不把它改回奔跑速度
+                    if (Math.Abs(speed - baseSpeed) <= 0.05f)
                         mover._moveSpeed = target;
                 }
             }
@@ -1155,7 +1166,16 @@ namespace BetterKingdom
                         if (col != null) halfW = Math.Max(0.3f, col.bounds.extents.x);
                     }
                     catch { }
-                    _wallBounds.Add(new WallBound { X = x, HalfW = halfW });
+                    // 施工中的城墙不能算作安全边界：刚付款的新墙/新塔会把最外层边界推到怪堆里，
+                    // 让驻守的工人被判定成“墙内/安全”而跑出去干活
+                    bool underConstruction = false;
+                    try
+                    {
+                        WorkableBuilding building = wall._workableBuilding;
+                        underConstruction = building != null && building.UnderConstruction;
+                    }
+                    catch { }
+                    _wallBounds.Add(new WallBound { X = x, HalfW = halfW, UnderConstruction = underConstruction });
                 }
             }
             catch { }
@@ -1213,6 +1233,139 @@ namespace BetterKingdom
         }
 
         /// <summary>
+        /// 单个单位此刻的避怪阈值：墙外 = 到该侧城墙外沿的距离 ×1.2，墙内 = 0；
+        /// 该侧没有已完成城墙（未建/全被摧毁）时改按到主城的距离 ×1.2 计算，连主城都取不到才兜底回退游戏原生距离 InitialFleeRange(6)。
+        /// 注意：本值只作为 ShouldFlee 强制补丁的“触发阈值”使用，不再写回 Worker/Archer.fleeRange 字段——
+        /// 游戏在 Worker.Behaviour 里还用 fleeRange 计算驻守/避怪落点（border - Random.Range(fleeRange, fleeRange+3) × 侧向，
+        /// 原版 6 意味着站在城墙内侧 6~9 格），把动态值（墙内=0、贴墙=很小）写进去会让落点贴到城墙上。
+        /// </summary>
+        internal static float ComputeFleeRange(Kingdom kingdom, float x)
+        {
+            try
+            {
+                Side side = AttackSideFromX(kingdom, x);
+                if (HasCompletedWallOnSide(kingdom, side))
+                {
+                    if (IsInsideCompletedWalls(kingdom, x, side)) return 0f;   // 墙内：不需要避怪
+                    if (TryGetOuterWallX(kingdom, side, out float outerX))
+                        return Mathf.Abs(x - outerX) * FleeRangeWallFactor;
+                }
+
+                // 没有城墙可参照（刚开始还没建墙，或该侧城墙已被摧毁）：以主城为参照
+                if (TryGetX(kingdom != null ? kingdom.castle : null, out float castleX))
+                    return Mathf.Abs(x - castleX) * FleeRangeWallFactor;
+            }
+            catch { }
+            return InitialFleeRange;
+        }
+
+        /// <summary>该侧是否有已完成城墙（施工中的不算；对侧的墙不算）。</summary>
+        private static bool HasCompletedWallOnSide(Kingdom kingdom, Side side)
+        {
+            float castleX;
+            bool hasCastle = TryGetX(kingdom != null ? kingdom.castle : null, out castleX);
+            for (int i = 0; i < _wallBounds.Count; i++)
+            {
+                WallBound b = _wallBounds[i];
+                if (b.UnderConstruction) continue;
+                if (hasCastle)
+                {
+                    if (side == Side.Left && b.X > castleX) continue;
+                    if (side == Side.Right && b.X < castleX) continue;
+                }
+                return true;
+            }
+            return false;
+        }
+
+        /// <summary>
+        /// 扫描全场“危险敌人”并缓存其世界 X。单位自带的 Scanner 探测半径固定约 6（Awake 时固定，
+        /// 前向范围是硬编码常量），fleeRange 写得再大，超出 6 的敌人也探测不到——这就是“避怪距离不对”的根因。
+        /// 这里改用 EnemyManager.AllEnemies 自行扫描，ShouldFlee 强制补丁只查这份缓存（仅 X 轴距离，与原生一致）。
+        /// 过滤口径与原生 ShouldFlee 一致：正在消失/已撤退/拖着战利品回巢/已死亡的不算威胁；
+        /// 任务建筑与巨蛇弱点等特殊标签不触发避怪；GreedGolem 不是 Enemy（继承 Workable），天然不在列表里。
+        /// </summary>
+        private static void RefreshFleeEnemies()
+        {
+            _fleeEnemyX.Clear();
+            try
+            {
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                EnemyManager em = managers != null ? managers.enemies : null;
+                if (kingdom == null || em == null) return;
+                var all = em.AllEnemies;
+                if (all == null || all.Count <= 0) return;
+
+                if (_fleeEnemyBuffer == null || _fleeEnemyBuffer.Length < all.Count)
+                    _fleeEnemyBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy>(Math.Max(all.Count, 16));
+                all.CopyTo(_fleeEnemyBuffer, 0);
+
+                for (int i = 0; i < all.Count; i++)
+                {
+                    Enemy e = _fleeEnemyBuffer[i];
+                    if (e == null) continue;
+                    try
+                    {
+                        if (e.IsDespawning) continue;          // 正在消失（被打死/完成使命）
+                        if (e.shouldRetreat) continue;         // 已决定撤回传送门
+                        if (e.loot != null) continue;          // 已捡到金币/战利品回巢，不再构成威胁
+                        Damageable d = e.damageable;
+                        if (d != null)
+                        {
+                            if (d.isDead) continue;
+                            // 死亡动画期间 isDead 可能还没置位：血量已空同样视为已死
+                            if (d.hitPoints <= 0 && d.initialHitPoints > 0) continue;
+                        }
+                        // 任务建筑/巨蛇弱点被打上特殊标签，原生避怪不会对它们逃跑
+                        if (e.CompareTag("QuestStructure") || e.CompareTag("SerpentWeakPoint")) continue;
+                    }
+                    catch { continue; }
+                    if (!TryGetX(e, out float ex)) continue;
+                    _fleeEnemyX.Add(ex);
+                }
+            }
+            catch { }
+        }
+
+        /// <summary>
+        /// ShouldFlee 强制补丁的共用判据：以 ComputeFleeRange 动态阈值（墙外=距墙×1.2，墙内=0）为准，
+        /// 若任一危险敌人与本单位的 X 轴距离小于该阈值则强制避怪。原生 ShouldFlee 有“手上有活就返回 false”的闸门，
+        /// 导致工人在开工状态即使敌人逼近也不避怪、先朝工作点走——状态机里 Flee(8) 优先于 Work(2)，
+        /// 这里强制返回 true 后，状态转移回调会自动 ResetWorkState(true) 干净卸活，不存在手动卸活的恢复难题。
+        /// 不再依赖写 fleeRange 字段：该字段同时参与驻守落点计算，写动态值会把驻守位置推到城墙边。
+        /// </summary>
+        internal static void ForceFleeIfThreatened(float fleeRange, float x, ref bool result)
+        {
+            if (result || fleeRange <= 0f || _fleeEnemyX.Count == 0) return;
+            float best = float.MaxValue;
+            for (int i = 0; i < _fleeEnemyX.Count; i++)
+            {
+                float d = Mathf.Abs(_fleeEnemyX[i] - x);
+                if (d < best) best = d;
+            }
+            if (best < fleeRange) result = true;
+        }
+
+        /// <summary>
+        /// 该单位所在侧是否还有“进攻怪物”（危险敌人缓存中与单位同侧的敌人）。
+        /// 分界与 AttackSideFromX 一致（主城 x）；主城取不到时保守返回 true（有敌人就视为有威胁）。
+        /// 用于避怪粘滞：一旦该侧触发过避怪，在进攻怪物清零前不让工人外出工作。
+        /// </summary>
+        internal static bool HasEnemyOnSide(Kingdom kingdom, float x)
+        {
+            if (_fleeEnemyX.Count == 0) return false;
+            if (!TryGetX(kingdom != null ? kingdom.castle : null, out float divider)) return true;
+            bool leftSide = x < divider;
+            for (int i = 0; i < _fleeEnemyX.Count; i++)
+            {
+                bool enemyLeft = _fleeEnemyX[i] < divider;
+                if (leftSide == enemyLeft) return true;
+            }
+            return false;
+        }
+
+        /// <summary>
         /// 修正位于墙体内部的弓箭手本体：仅处理守墙状态（ShouldGoToWall 或已在守卫槽）的弓箭手。
         /// 根因：游戏原生bug导致 _guardDepth 守卫深度漂移为负值且不再恢复，
         /// 目标站位 = 墙x ± (最小间距 + 深度×单位间距 + 随机偏移)，负深度会吃掉与墙间距，使弓箭手站进墙体内部。
@@ -1265,172 +1418,29 @@ namespace BetterKingdom
             catch { }
         }
 
-        private static bool TryGetX<T>(T component, out float x) where T : Component
+        internal static bool TryGetX<T>(T component, out float x) where T : Component
         {
             x = 0f;
             try { if (component == null) return false; x = component.transform.position.x; return true; }
             catch { return false; }
         }
 
-        // ==================== 工人避险（墙外有进攻怪物时撤回，不区分昼夜） ====================
+        // ==================== 避怪阈值维护（城墙边界缓存 + ShouldFlee 强制补丁） ====================
 
         /// <summary>
-        /// 检测两侧是否有"进攻状态"的怪物（存活、未撤退、未携带战利品逃走）。
-        /// 结果供 Worker.ShouldShelter 补丁使用：该侧有怪物且工人自身在安全距离外时跑回城墙，
-        /// 直到该侧进攻怪物归零。正在工作的工人不打断（Work 状态优先级高于 Shelter，
-        /// 原生行为就是干完手上的活再避险）。
+        /// 刷新 ShouldFlee 强制补丁所需的城墙边界缓存（每 0.5 秒重建，建墙/破墙后尽快生效）。
+        /// 不再往 Worker/Archer 的 fleeRange 字段写动态值：游戏还用该字段计算驻守/避怪落点
+        /// （落点 = 城墙内侧 Random.Range(fleeRange, fleeRange+3)），写入动态值会导致工人驻守位置贴墙。
+        /// 动态避怪阈值改由 ComputeFleeRange 在补丁内直接计算。
         /// </summary>
-        private void RefreshSideAssault()
+        private void RefreshWallBounds()
         {
-            bool wasLeft = _attackOnLeft, wasRight = _attackOnRight;
-            _attackOnLeft = _attackOnRight = false;
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                // 不按昼夜判断：传送门离城墙较远时游戏会在天黑前提前放怪，
-                // 只在夜间检测会把这些白天出击的怪物完全忽略
-                if (kingdom != null)
-                {
-                    if (!TryGetX(kingdom.castle, out float castleX)) { }   // 无城堡时无法判断侧别
-                    else
-                    {
-                        EnemyManager em = managers.enemies;
-                        var all = em != null ? em.AllEnemies : null;
-                        if (all != null && all.Count > 0)
-                        {
-                            if (_assaultEnemyBuffer == null || _assaultEnemyBuffer.Length < all.Count)
-                                _assaultEnemyBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Enemy>(Math.Max(all.Count, 16));
-                            all.CopyTo(_assaultEnemyBuffer, 0);
-
-                            for (int i = 0; i < all.Count; i++)
-                            {
-                                Enemy e = _assaultEnemyBuffer[i];
-                                if (!IsAssaultingEnemy(e)) continue;
-                                if (!TryGetX(e, out float x)) continue;
-                                if (x < castleX) _attackOnLeft = true; else _attackOnRight = true;
-                            }
-                        }
-                    }
-                }
-            }
-            catch { }
-
-            // 无论是否检测到怪物都要走到这里：怪物刚出时就撤下还没开始的排队工作（不再被派出去），
-            // 怪物归零后立即把工作还回去（游戏夜间不会重分配，只能靠这里）
-            SuspendUnsafeQueuedWork();
-            ResumeSuspendedWork();
-
-            // 某侧进攻怪物刚归零：立即让游戏重新分配工作。
-            // 游戏原生的 Kingdom.ReassignWork 只在 Director.IsDaytime 时由 Worker.Behaviour 调用，
-            // 夜里收工后不分配，工人要等到天亮才会再出门；这里在威胁解除的瞬间补一次分配
-            if ((wasLeft && !_attackOnLeft) || (wasRight && !_attackOnRight))
-            {
-                try
-                {
-                    Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                    Kingdom kingdom = managers != null ? managers.kingdom : null;
-                    if (kingdom != null) kingdom.ReassignWork();
-                }
-                catch { }
-            }
-        }
-
-        /// <summary>
-        /// 撤下工人“已经分配但还没开始”的不安全墙外工作（_queuedWork）。
-        /// 这是工人仍会跑去工作的根源：工作往往在怪物出现之前就已分配好，AssignJob 拦截管不到，
-        /// 而 Work 状态优先级高于 Shelter，工人会一路走到危险区。
-        /// 判定只看工作点本身（工作点所属侧是否被进攻、工作点是否在安全距离外），
-        /// 与接活工人此时在哪一侧无关：左侧出怪时，右侧工人手里那份左侧危险工作同样会被撤下。
-        /// 正在做的工作（_currentWork）不动：按原生逻辑干完手上的活，之后再进入避险回城。
-        /// </summary>
-        private static void SuspendUnsafeQueuedWork()
-        {
-            if (!_attackOnLeft && !_attackOnRight) return;
             try
             {
                 Managers managers = SingletonMonoBehaviour<Managers>.Inst;
                 Kingdom kingdom = managers != null ? managers.kingdom : null;
                 if (kingdom == null) return;
-                var workers = kingdom.Workers;
-                if (workers == null || workers.Count <= 0) return;
-
-                if (_suspendWorkerBuffer == null || _suspendWorkerBuffer.Length < workers.Count)
-                    _suspendWorkerBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(workers.Count, 16));
-                workers.CopyTo(_suspendWorkerBuffer, 0);
-
-                int count = workers.Count;
-                for (int i = 0; i < count; i++)
-                {
-                    Worker w = _suspendWorkerBuffer[i];
-                    if (w == null) continue;
-                    // 工人自身已在危险位置：先把手上的活全部卸下，否则 Work 状态优先于 Shelter，
-                    // 只改 ShouldShelter 的结果它仍然会去干活而不回城墙
-                    if (ShouldFleeToWall(w)) { ReleaseWorkerWork(w); continue; }
-
-                    Workable job;
-                    try { job = w._queuedWork; } catch { continue; }
-                    if (job == null) continue;
-                    float x;
-                    if (!TryGetX(job, out x)) continue;
-                    if (IsWorkSpotSafe(kingdom, x)) continue;   // 工作点在安全范围内，照常去干
-
-                    // 走游戏自己的取消流程释放工作位占用，否则之后同类工作不会再被分配
-                    try { job.CancelWork(w); } catch { }
-                    try { if (w._queuedWork == job) w._queuedWork = null; } catch { }
-                    if (_suspendedJobs.Count < 64)
-                        _suspendedJobs.Add(new SuspendedJob { Worker = w, Job = job });
-                }
-            }
-            catch { }
-        }
-
-        /// <summary>
-        /// 卸下工人的当前工作与排队工作，让它不再满足 Work 状态条件，从而进入 ShouldShelter 的 Shelter 状态回城。
-        /// 仅用于“工人自身已处在危险位置”的情况：状态选择里 Work 优先级高于 Shelter，
-        /// 不卸工作的话工人会一路走到危险区把活干完才肯撤退（原生行为）。
-        /// 当前工作走游戏自己的 ResetWorkState(false) 收工流程，释放工作位并触发一次原生重分配。
-        /// </summary>
-        private static void ReleaseWorkerWork(Worker w)
-        {
-            if (w == null) return;
-            try
-            {
-                Workable current;
-                try { current = w._currentWork; } catch { current = null; }
-                if (current != null)
-                {
-                    try { w.ResetWorkState(false); }
-                    catch
-                    {
-                        try { current.CancelWork(w); } catch { }
-                        try { if (w._currentWork == current) w._currentWork = null; } catch { }
-                    }
-                }
-
-                Workable queued;
-                try { queued = w._queuedWork; } catch { queued = null; }
-                if (queued != null)
-                {
-                    try { queued.CancelWork(w); } catch { }
-                    try { if (w._queuedWork == queued) w._queuedWork = null; } catch { }
-                }
-                try { w._forceWork = false; } catch { }
-
-                // 状态选择里还有两个优先级高于 Shelter 的状态，同样会挡住回城：
-                //   128 = 正在拾取地面掉落物（_targetTool 非空），256 = 在队列中（currentFormation 非空）。
-                // 工人已处在危险位置时放弃拾取目标、退出队列，状态选择才会落到 Shelter。
-                try { if (w._targetTool != null) w.SetDroppableTarget(null); } catch { }
-                try
-                {
-                    Formation formation = w.currentFormation;
-                    if (formation != null)
-                        formation.UnregisterUnit(w.Cast<Formation.IFormationUnit>());
-                }
-                catch
-                {
-                    try { w.OnLeaveFormation(); } catch { }
-                }
+                CollectWallBounds(kingdom);
             }
             catch { }
         }
@@ -1521,7 +1531,7 @@ namespace BetterKingdom
         /// 把“已分配但还没开始”的排队工作改派给离工作点最近的空闲工人。
         /// 原版 ActorTracker 按工人集合的固定顺序分配，先入队/先遍历的工人先接活，
         /// 经常出现远处的工人拿到工作、近处的空闲工人反而没活。
-        /// 这里只动 _queuedWork（未开工），不打断已经在做的工作；危险工作点留给避险逻辑处理。
+        /// 这里只动 _queuedWork（未开工），不打断已经在做的工作。
         /// </summary>
         private static void RebalanceQueuedWork()
         {
@@ -1540,7 +1550,7 @@ namespace BetterKingdom
                 workers.CopyTo(_balanceWorkerBuffer, 0);
 
                 // 先筛一次“可接活的空闲工人”池，供本轮所有排队工作共用。
-                // 原实现在每个排队工作上重复检查全部工人的空闲/避险状态，是 O(n²) 的互操作调用；
+                // 原实现在每个排队工作上重复检查全部工人的空闲状态，是 O(n²) 的互操作调用；
                 // 筛成池后内层只剩浮点距离比较，1 秒一轮也不会形成帧尖峰。
                 if (_balanceIdleBuffer == null || _balanceIdleBuffer.Length < count)
                     _balanceIdleBuffer = new Il2CppInterop.Runtime.InteropTypes.Arrays.Il2CppReferenceArray<Worker>(Math.Max(count, 16));
@@ -1557,7 +1567,6 @@ namespace BetterKingdom
                     catch { idle = false; }
                     if (!idle) continue;                              // 只考虑完全空闲的工人
                     try { if (candidate.HasEmbarkableTarget()) continue; } catch { }
-                    if (ShouldFleeToWall(candidate)) continue;        // 正在避险回城的工人不再接活
                     float candidateX;
                     if (!TryGetX(candidate, out candidateX)) continue;
                     _balanceIdleBuffer[idleCount] = candidate;
@@ -1582,7 +1591,6 @@ namespace BetterKingdom
 
                     float jobX, holderX;
                     if (!TryGetX(job, out jobX) || !TryGetX(holder, out holderX)) continue;
-                    if (!IsWorkSpotSafe(kingdom, jobX)) continue;       // 危险工作点交给避险逻辑，不参与改派
                     float holderDist = Mathf.Abs(jobX - holderX);
 
                     Worker best = null;
@@ -1613,92 +1621,6 @@ namespace BetterKingdom
 
                     try { best.AssignJob(job); } catch { }
                     if (bestSlot >= 0) _balanceIdleBuffer[bestSlot] = null;   // 已接活，移出候选池
-                }
-            }
-            catch { }
-        }
-
-        /// <summary>
-        /// 撤销某个工人手上“已分配但还没开始”的不安全工作，并清掉强制工作标记。
-        /// 游戏还有绕过 AssignJob 的分配路径（例如付费接活：IUnitControllable.UpdatePayState 直接写 _queuedWork），
-        /// 补丁在那些动作结束后立刻调用本方法，保证进攻期间危险工作点不会被任何人接下。
-        /// </summary>
-        public static bool CancelUnsafeQueuedWork(Worker worker)
-        {
-            if (worker == null) return false;
-            try
-            {
-                Workable job = worker._queuedWork;
-                if (job == null) return false;
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom == null) return false;
-                float x;
-                if (!TryGetX(job, out x)) return false;
-                if (IsWorkSpotSafe(kingdom, x)) return false;   // 工作点在安全范围内，照常去干
-
-                try { job.CancelWork(worker); } catch { }
-                try { if (worker._queuedWork == job) worker._queuedWork = null; } catch { }
-                try { worker._forceWork = false; } catch { }   // 付费接活会置强制工作标志，撤销时一并清掉
-                return true;
-            }
-            catch { }
-            return false;
-        }
-
-        /// <summary>
-        /// 某份工作此刻能不能被工人真正开始干：进攻怪物在该工作点所属侧且超出安全距离时一律不行。
-        /// 供 Worker.SetCurrentWork 补丁作为最后一道防线（所有把排队工作转成当前工作的路径都经过它）。
-        /// </summary>
-        public static bool CanStartWork(Workable job)
-        {
-            if (job == null) return true;
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom == null) return true;
-                float x;
-                if (!TryGetX(job, out x)) return true;
-                return IsWorkSpotSafe(kingdom, x);
-            }
-            catch { }
-            return true;
-        }
-
-        /// <summary>
-        /// 该侧进攻怪物归零后立刻把撤下的排队工作还回去（不等天亮，游戏夜间不会重新分配工作）。
-        /// 工作位暂时不可用或被别处占用时保留记录，下次刷新再试。
-        /// </summary>
-        private static void ResumeSuspendedWork()
-        {
-            if (_suspendedJobs.Count == 0) return;
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom == null) return;
-
-                for (int i = _suspendedJobs.Count - 1; i >= 0; i--)
-                {
-                    SuspendedJob c = _suspendedJobs[i];
-                    if (c.Worker == null || c.Job == null) { _suspendedJobs.RemoveAt(i); continue; }
-
-                    float x;
-                    if (!TryGetX(c.Job, out x)) { _suspendedJobs.RemoveAt(i); continue; }
-                    if (!IsWorkSpotSafe(kingdom, x)) continue;   // 工作点所属侧仍有进攻怪物或在安全距离外，继续等待
-
-                    bool busy;
-                    try { busy = c.Worker._queuedWork != null || c.Worker._currentWork != null; }
-                    catch { busy = true; }
-                    if (busy) { _suspendedJobs.RemoveAt(i); continue; }   // 游戏已经重新派了活
-
-                    bool available;
-                    try { available = c.Job.JobAvailable(); } catch { available = false; }
-                    if (!available) continue;   // 工作位临时被占用，下次再试
-
-                    _suspendedJobs.RemoveAt(i);
-                    try { c.Worker.AssignJob(c.Job); } catch { }
                 }
             }
             catch { }
@@ -1822,97 +1744,18 @@ namespace BetterKingdom
             return SafeId(k) == _chargeBestId;
         }
 
-        /// <summary>怪物是否处于进攻状态：在场、存活、未决定撤退、未携带战利品离开。
-        /// 携带战利品（捡到金币/王冠拖回传送门）或已开始消失的怪物都不算进攻怪物，
-        /// 否则它们会在回程途中被误判成威胁，导致工人迟迟不敢出门工作。</summary>
-        private static bool IsAssaultingEnemy(Enemy e)
-        {
-            try
-            {
-                if (e == null || e.IsDespawning) return false;
-                if (e.shouldRetreat) return false;   // 已决定撤回传送门
-                Damageable d = e.damageable;
-                if (d != null)
-                {
-                    if (d.isDead) return false;
-                    // 判定死亡时 isDead 可能晚于血量归零（死亡动画期间仍是 false），
-                    // 只靠 isDead 会让该侧威胁多挂一段时间，工人白跑一趟
-                    try { if (d.hitPoints <= 0 && d.initialHitPoints > 0) return false; } catch { }
-                }
-                if (!e.gameObject.activeSelf) return false;
-                return e.loot == null;   // 捡到金币/战利品逃走的怪物不再算进攻
-            }
-            catch { }
-            return false;
-        }
-
-        /// <summary>该侧城墙外是否有进攻中的怪物（含天黑前提前出击的怪物）。</summary>
-        public static bool IsSideUnderAttack(Side side)
-        {
-            if (side == Side.Left) return _attackOnLeft;
-            if (side == Side.Right) return _attackOnRight;
-            return false;
-        }
-
         /// <summary>
-        /// 该工人此刻是否应该跑回城墙避险：它所在的一侧有进攻中的怪物，且它自身位置在安全距离之外。
-        /// 供 Worker.ShouldShelter 补丁使用——把结果强制为真后，游戏自己的 Shelter 状态会把工人带回城墙驻守。
-        /// 不干预工作：Work 状态优先级高于 Shelter，正在干活/已排活的工会先把活干完再避险（与游戏原生一致）。
+        /// 位置是否在该侧已完成的城墙内侧（以最外层已完成城墙为界；该侧没有城墙时以主城为界，等同墙外）。
+        /// 施工中的城墙（_workableBuilding.UnderConstruction）不参与判断。
         /// </summary>
-        public static bool ShouldFleeToWall(Worker w)
+        private static bool IsInsideCompletedWalls(Kingdom kingdom, float x, Side side)
         {
-            if (!_attackOnLeft && !_attackOnRight) return false;
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom == null) return false;
-                float x;
-                if (!TryGetX(w, out x)) return false;
-                return !IsPositionSafe(kingdom, x, AttackSideFromX(kingdom, x));
-            }
-            catch { }
-            return false;
-        }
-
-        /// <summary>
-        /// 判断某个位置在该侧是否处于安全距离内。
-        /// 该侧没有出击怪物时任何位置都安全；墙内始终安全；墙外则要求距该侧城墙外沿不超过 SafeDistance，
-        /// 该侧还没有城墙时以主城（城堡）位置为参照起算。
-        /// </summary>
-        public static bool IsPositionSafe(Kingdom kingdom, float x, Side side)
-        {
-            try
-            {
-                if (!IsSideUnderAttack(side)) return true;   // 该侧没有出击的怪物：任何位置都安全
-
-                bool within;
-                try { within = kingdom.IsWithinWalls(x); } catch { within = true; }
-                if (within) return true;                    // 墙内始终安全
-
-                float outerX;
-                if (!TryGetOuterWallX(kingdom, side, out outerX)) return false;   // 连城堡位置都取不到时按不安全处理
-
-                return Mathf.Abs(x - outerX) <= SafeDistance;
-            }
-            catch { }
-            return false;
-        }
-
-        /// <summary>
-        /// 统一的工作点安全判定：以“工作点所属侧”为准，判断该工作点此刻能不能被任何人接受。
-        /// 只要该侧有进攻怪物、工作点在墙外且超出安全距离，就返回 false——与接活工人当前在哪一侧无关。
-        /// AssignJob 拦截、排队工作撤下/还回全部走这一条判据，避免两侧口径不一致。
-        /// </summary>
-        public static bool IsWorkSpotSafe(Kingdom kingdom, float x)
-        {
-            if (kingdom == null) return true;
-            return IsPositionSafe(kingdom, x, AttackSideFromX(kingdom, x));
+            if (!TryGetOuterWallX(kingdom, side, out float outerX)) return false;
+            return side == Side.Left ? x >= outerX : x <= outerX;
         }
 
         /// <summary>
         /// 按主城（城堡）位置把坐标分到左右侧——与怪物分侧口径完全一致。
-        /// 以前工作点用露营火堆分侧、怪物用城堡分侧，两者位置略有差异时边界附近的工作会被判到另一侧。
         /// 取不到城堡位置时退回露营火堆位置兜底。
         /// </summary>
         private static Side AttackSideFromX(Kingdom kingdom, float x)
@@ -1921,27 +1764,6 @@ namespace BetterKingdom
             if (TryGetX(kingdom != null ? kingdom.castle : null, out divider))
                 return x < divider ? Side.Left : Side.Right;
             return SideFromX(kingdom, x);
-        }
-
-        /// <summary>
-        /// 取该侧“安全距离”边界的世界 X（供小地图红线使用）：
-        /// 左侧为城墙外沿 - SafeDistance，右侧为外沿 + SafeDistance；该侧还没有城墙时以主城位置为参照。
-        /// </summary>
-        public static bool TryGetSafeEdge(Side side, out float x)
-        {
-            x = 0f;
-            try
-            {
-                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
-                Kingdom kingdom = managers != null ? managers.kingdom : null;
-                if (kingdom == null) return false;
-                float outerX;
-                if (!TryGetOuterWallX(kingdom, side, out outerX)) return false;
-                x = side == Side.Left ? outerX - SafeDistance : outerX + SafeDistance;
-                return true;
-            }
-            catch { }
-            return false;
         }
 
         /// <summary>
@@ -1960,7 +1782,8 @@ namespace BetterKingdom
             for (int i = 0; i < n; i++)
             {
                 WallBound b = _wallBounds[i];
-                // 只统计城堡这一侧的墙：对侧的墙不能作为本侧的安全距离参照
+                if (b.UnderConstruction) continue;   // 墙沿只按已完成城墙计算
+                // 只统计城堡这一侧的墙：对侧的墙不能作为本侧的参照
                 if (hasCastle)
                 {
                     if (side == Side.Left && b.X > castleX) continue;
@@ -1978,8 +1801,7 @@ namespace BetterKingdom
                 x = best;
                 return true;
             }
-            // 该侧没有城墙（或尚未建成）：以城堡（营地）位置为参照，
-            // 否则会因为没有墙而把所有墙外工作都判成危险，连第一道墙都建不起来
+            // 该侧没有城墙（或尚未建成）时退回城堡位置：调用方需先用 HasCompletedWallOnSide 区分“无墙”的情况
             if (hasCastle)
             {
                 x = castleX;
@@ -2120,77 +1942,6 @@ namespace BetterKingdom
     }
 
     /// <summary>
-    /// 拒绝不安全的墙外工作：该工作点所属侧有怪物出击、且工作点超出安全距离时，不论哪个工人来接手一律拒绝，
-    /// 直到该侧进攻怪物归零。判定只看工作点，不看工人当前在哪一侧——左侧出怪时右侧工人也不能接左侧危险活。
-    /// 另外，工人自身已处在安全距离之外、正在避险回城时也不再接新活，避免它被重新派出去。
-    /// 该侧无怪物、工作点墙内或安全距离内一律放行。
-    /// </summary>
-    [HarmonyPatch(typeof(Worker), nameof(Worker.AssignJob))]
-    public static class WorkerAssignSafeJobPatch
-    {
-        public static bool Prefix(Worker __instance, Workable job)
-        {
-            if (!FeatureBehaviour.CanStartWork(job)) return false;
-            if (__instance != null && FeatureBehaviour.ShouldFleeToWall(__instance)) return false;
-            return true;
-        }
-    }
-
-    /// <summary>
-    /// 最后一道防线：任何把排队工作转成“当前工作”的路径（包括绕过 AssignJob 的付费接活）都会被拦下。
-    /// Worker.Behaviour 协程里 SetCurrentWork(_queuedWork) 是唯一的转换漏斗，工作点在进攻侧安全距离外时
-    /// 拒绝启动并释放工作位；工人自身正在避险回城时也拒绝启动，保证它先回到城墙。
-    /// 传 null 的调用（清空工作）一律放行。
-    /// </summary>
-    [HarmonyPatch(typeof(Worker), nameof(Worker.SetCurrentWork))]
-    public static class WorkerSetCurrentWorkSafePatch
-    {
-        public static bool Prefix(Worker __instance, Workable __0)
-        {
-            if (__0 == null) return true;
-            bool fleeing = __instance != null && FeatureBehaviour.ShouldFleeToWall(__instance);
-            if (!fleeing && FeatureBehaviour.CanStartWork(__0)) return true;
-            try { __0.CancelWork(__instance); } catch { }   // 释放工作位，避免之后同类工作再也分配不出去
-            try { if (__instance != null && __instance._queuedWork == __0) __instance._queuedWork = null; } catch { }
-            return false;
-        }
-    }
-
-    /// <summary>
-    /// 付费接活路径：Worker 实现 IUnitControllable 的 UpdatePayState 在玩家长按支付时，
-    /// 会把付费范围内的 Workable 直接写进 _queuedWork 并置强制工作标志，完全绕过 AssignJob。
-    /// 这里在方法结束后立刻复查，工作点在进攻侧安全距离外时立即撤销，避免工人被派去危险区域。
-    /// 注意 interop 里显式接口方法名为下划线形式（IUnitControllable_UpdatePayState）。
-    /// </summary>
-    [HarmonyPatch(typeof(Worker), nameof(Worker.IUnitControllable_UpdatePayState))]
-    public static class WorkerPayWorkSafePatch
-    {
-        public static void Postfix(Worker __instance)
-        {
-            FeatureBehaviour.CancelUnsafeQueuedWork(__instance);
-        }
-    }
-
-    /// <summary>
-    /// 工人避险回城：游戏原生的 ShouldShelter 只在 Kingdom.isSafe 为假时才会返回真，
-    /// 白天（或换岛后王国被兜底转成安全态）即使本侧有怪物出击，工人也不会退回城墙。
-    /// 这里在“该侧有怪物出击 + 工人自身已在安全距离之外”时强制结果取真，
-    /// 让游戏自己的 Shelter 状态把工人带回城墙驻守，直到该侧进攻怪物归零。
-    /// 注意状态选择里 Work 优先级高于 Shelter，因此 FeatureBehaviour 会在同一判定成立时
-    /// 先卸下工人的当前/排队工作（ReleaseWorkerWork），否则工作状态会盖过避险状态。
-    /// 全程不碰 Kingdom.isSafe 与 Director 时钟，因此不会重新引发“复仇血月结束后时间卡住”的问题。
-    /// </summary>
-    [HarmonyPatch(typeof(Worker), nameof(Worker.ShouldShelter))]
-    public static class WorkerRecallShelterPatch
-    {
-        public static void Postfix(Worker __instance, ref bool __result)
-        {
-            if (__result || __instance == null) return;
-            if (FeatureBehaviour.ShouldFleeToWall(__instance)) __result = true;
-        }
-    }
-
-    /// <summary>
     /// 工人启用（读档恢复/新生成）后立即纠正驻守侧：原生 OnEnable 已先按城堡侧初始化，
     /// 只靠每 2 秒的周期检测会让工人在读档后先跑向旧驻守侧，直到夜间才回到改派侧。
     /// </summary>
@@ -2272,6 +2023,97 @@ namespace BetterKingdom
             if (__instance == null) return true;
             // 窗口显示成功则跳过原生召唤，等玩家确认后再调用
             return !FeatureBehaviour.BeginBellSelection(__instance);
+        }
+    }
+
+    /// <summary>
+    /// 工人避怪强制补丁：原生 ShouldFlee 开头有“手上有活（_currentWork/_queuedWork 非空）就返回 false”的闸门，
+    /// 所以开工的工人即使敌人逼近也不会避怪，而是继续朝工作点走（表现为“避怪时先向工作地点跑”）。
+    /// 另外工人自带的 Scanner 探测半径固定约 6（前向是硬编码常量），动态阈值再大也探测不到远处敌人（“避怪距离不对”）。
+    /// 这里按模组缓存的危险敌人表 + ComputeFleeRange 动态阈值强制返回 true：状态机里 Flee(8) 优先于 Work(2)，
+    /// 转移回调会自动 ResetWorkState(true) 卸活并转入 Flee，无需手动处理工作状态。
+    /// 另外还有避怪粘滞：该侧有进攻怪物时一旦触发过避怪，就把工人记入 _stickyFleeWorkers，
+    /// 此后怪物清零前 ShouldFlee 恒真——避免阈值边缘来回抖动导致的“避怪过程中间断性外出工作”。
+    /// 粘滞只对城墙外的工人生效：回到城墙内后解除，退化为游戏原生驻守行为，避免墙内持续 Flee 跑向另一侧。
+    /// 注意：不写回 fleeRange 字段——该字段还参与驻守/避怪落点计算（城墙内侧 Random.Range(fleeRange, fleeRange+3)），
+    /// 写动态值会把驻守位置推到城墙边。
+    /// </summary>
+    [HarmonyPatch(typeof(Worker), nameof(Worker.ShouldFlee))]
+    public static class WorkerForceFleePatch
+    {
+        public static void Postfix(Worker __instance, ref bool __result)
+        {
+            if (__instance == null) return;
+            try
+            {
+                if (!FeatureBehaviour.TryGetX(__instance, out float x)) return;
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return;
+                float fleeRange = FeatureBehaviour.ComputeFleeRange(kingdom, x);
+                FeatureBehaviour.ForceFleeIfThreatened(fleeRange, x, ref __result);
+
+                // 避怪粘滞：该侧有进攻怪物时，一旦触发过避怪（原生或强制），在怪物清零前持续避怪、
+                // 不再外出工作（状态机 Flee 优先于 Work，ShouldFlee 恒真即一直保持 Flee 态）。
+                // 但粘滞只对城墙外的工人生效：回到城墙内（fleeRange=0）后解除粘滞，退化为游戏原生
+                // 驻守行为（原生墙内按 fleeRange=6 近距离避险），避免墙内持续 Flee 跑向另一侧。
+                int id = __instance.GetInstanceID();
+                if (FeatureBehaviour.HasEnemyOnSide(kingdom, x) && fleeRange > 0f)
+                {
+                    if (__result || FeatureBehaviour._stickyFleeWorkers.Contains(id))
+                    {
+                        __result = true;
+                        FeatureBehaviour._stickyFleeWorkers.Add(id);
+                    }
+                }
+                else
+                {
+                    FeatureBehaviour._stickyFleeWorkers.Remove(id);   // 怪物清零或已回到城墙内：解除粘滞，交还原生行为
+                }
+            }
+            catch { }
+        }
+    }
+
+    /// <summary>
+    /// 弓箭手避怪强制补丁：与 Worker 同理——原生 ShouldFlee 实时读 fleeRange，但 Scanner 探测半径固定
+    /// （前向常量 6、后向 = 生成时的 shootRange），超出探测范围就看不见敌人。按模组缓存的危险敌人表 +
+    /// ComputeFleeRange 动态阈值强制返回 true；fleeRange 字段保持原值（它还参与落点计算）。
+    /// 避怪粘滞与工人一致：该侧有进攻怪物时一旦触发过避怪就记入 _stickyFleeArchers，怪物清零前
+    /// ShouldFlee 恒真；粘滞只对城墙外弓箭手生效，回到城墙内后解除、退化为原生驻守行为。
+    /// </summary>
+    [HarmonyPatch(typeof(Archer), nameof(Archer.ShouldFlee))]
+    public static class ArcherForceFleePatch
+    {
+        public static void Postfix(Archer __instance, ref bool __result)
+        {
+            if (__instance == null) return;
+            try
+            {
+                if (!FeatureBehaviour.TryGetX(__instance, out float x)) return;
+                Managers managers = SingletonMonoBehaviour<Managers>.Inst;
+                Kingdom kingdom = managers != null ? managers.kingdom : null;
+                if (kingdom == null) return;
+                float fleeRange = FeatureBehaviour.ComputeFleeRange(kingdom, x);
+                FeatureBehaviour.ForceFleeIfThreatened(fleeRange, x, ref __result);
+
+                // 避怪粘滞（与工人相同）：粘滞只对城墙外的弓箭手生效，
+                // 回到城墙内（fleeRange=0）后解除粘滞，交还原生驻守行为。
+                int id = __instance.GetInstanceID();
+                if (FeatureBehaviour.HasEnemyOnSide(kingdom, x) && fleeRange > 0f)
+                {
+                    if (__result || FeatureBehaviour._stickyFleeArchers.Contains(id))
+                    {
+                        __result = true;
+                        FeatureBehaviour._stickyFleeArchers.Add(id);
+                    }
+                }
+                else
+                {
+                    FeatureBehaviour._stickyFleeArchers.Remove(id);   // 怪物清零或已回到城墙内：解除粘滞，交还原生行为
+                }
+            }
+            catch { }
         }
     }
 }
